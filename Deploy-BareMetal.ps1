@@ -1,4 +1,4 @@
-﻿[cmdletbinding()]
+[cmdletbinding()]
 param
 (
     [parameter(Mandatory=$true)]
@@ -9,6 +9,15 @@ param
 
     [parameter(Mandatory=$true)]
     [string]$HostName,
+
+    [parameter(Mandatory=$true)]
+    [string]$ClusterName,
+
+    [parameter(Mandatory=$true)]
+    [string]$VMMRunAsAccountName,
+
+    [parameter(Mandatory=$true)]
+    [int]$BootDiskSize = 60,
 
     [parameter(Mandatory=$false)]
     [switch]$ReverseSMBiosGuid
@@ -50,11 +59,27 @@ Import-Module ActiveDirectory
 Import-Module VirtualMachineManager
 
 $ErrorActionPreference = "Stop"
-$VMMostGroupName = "All hosts"
 
 # strip domain from hostname
 $domainDNSName = (Get-WmiObject -Class Win32_ComputerSystem).Domain
 $HostName = $HostName.Replace($domainDNSName, "")
+
+$BMCRunAsAccount = Get-SCRunasAccount $BMCRunAsAccountName
+if ($BMCRunAsAccount -eq $null)
+{
+    Write-Host "Unable to get RunAs account `"$BMCRunAsAccountName`"!" -ForegroundColor Red
+    return
+}
+
+$VMMRunAsAccount = Get-SCRunasAccount $VMMRunAsAccountName
+if ($VMMRunAsAccount -eq $null)
+{
+    Write-Host "Unable to get RunAs account `"$VMMRunAsAccountName`"!" -ForegroundColor Red
+    return
+}
+
+$hostCluster = Get-SCVMHostCluster $ClusterName -ErrorAction Stop
+$VMMostGroup = $hostCluster.HostGroup
 
 # VMM
 $vmHost = Get-SCVMHost $HostName -ErrorAction SilentlyContinue
@@ -73,33 +98,16 @@ $samName = "$HostName$"
 $serverADObject = Get-ADObject -Filter {SamAccountName -eq $samName}
 if ($serverADObject -ne $null)
 {
-    #if (!$Force)
-    #{ 
-    #    $answer = GetYesNoAnswer "Confirm remove" "$HostName$ account already exist in Active Directory. Confirm remove?"
-    #    if ($answer -ne 0)
-    #    {
-	#        return
-    #    }
-        Write-Host "$HostName$ account already exist in Active Directory. Removing..."
-        Remove-ADObject $serverADObject -Recursive -Confirm:$false
-    #}
+    Write-Host "$HostName$ account already exist in Active Directory. Removing..."
+    Remove-ADObject $serverADObject -Recursive -Confirm:$false
 }
 
 Write-Host "Remove DNS records for $HostName..."
 while ( $(Resolve-DnsName $HostName -ErrorAction SilentlyContinue) -ne $null )
 {
     [void](Invoke-Expression "cmd /c dnscmd $domainDNSName /recorddelete $domainDNSName $HostName A /f 2>&1")
-    #Write-Host "cmd /c dnscmd $domainDNSName /recorddelete $domainDNSName $HostName A /f"
-    #Invoke-Expression "cmd /c dnscmd $domainDNSName /recorddelete $domainDNSName $HostName A /f"
     Clear-DnsClientCache
     Start-Sleep -Seconds 5
-}
-
-$BMCRunAsAccount = Get-SCRunasAccount $BMCRunAsAccountName
-if ($BMCRunAsAccount -eq $null)
-{
-    Write-Host "Unable to get RunAs account `"$BMCRunAsAccountName`"!" -ForegroundColor Red
-    return
 }
 
 Write-Host "Discovering server `"$($BMCAddress)`"..."
@@ -168,17 +176,8 @@ if ($bladePhysicalProfile -eq $null)
     return
 }
 
-# !!!TEMP!!!
-#$deployBlade.PhysicalMachine.Disks | ft  Name,DeviceName,Bus,BusType,Lun,SerialNumber,Target,@{N="Size";E={[Math]::Ceiling($_.Capacity/1gb)}}
-#$firstDisk
-#return
-# !!!TEMP!!!
-
-# get disk for OS deployment
-#$firstDisk = $deployBlade.PhysicalMachine.Disks | ? DeviceName -eq "\\.\PHYSICALDRIVE0" #[1]#
-#$firstDisk | ft  Name,DeviceName,Bus,BusType,Lun,SerialNumber,Target,@{N="Size";E={$_.Capacity/1gb}}
 Write-Host "Finding disk suitable for OS deployment..." -ForegroundColor Cyan
-$firstDisk = $deployBlade.PhysicalMachine.Disks | ?{[Math]::Ceiling($($_.Capacity/1gb)) -eq 60 -and $_.Name -match "HUAWEI"} | Select -First 1
+$firstDisk = $deployBlade.PhysicalMachine.Disks | ?{[Math]::Ceiling($($_.Capacity/1gb)) -eq $BootDiskSize -and $_.Name -match "HUAWEI"} | Select -First 1
 
 if ($firstDisk -eq $null)
 {
@@ -187,11 +186,6 @@ if ($firstDisk -eq $null)
 }
 
 $deployOSDisk = $firstDisk.DeviceName
-#if ($firstDisk.SerialNumber -ne "2102351CMA10H80000070025")
-#{
-#    Write-Host "Wrong disk `"$($firstDisk.Name) $([Math]::Round($firstDisk.Capacity / 1Gb))Gb`" with device name `"$deployOSDisk`"!! You ass will be burned!" -ForegroundColor Red
-#    return
-#}
 $answer = GetYesNoAnswer "Confirm deployment" "Are you sure to use `"$($firstDisk.Name) $([Math]::Ceiling($firstDisk.Capacity / 1Gb))Gb`" with device name `"$deployOSDisk`" for OS deployment?"
 if ($answer -ne 0)
 {
@@ -275,7 +269,6 @@ foreach($vn in $profileVirtualNetworkAdapters)
     $deploymentNetworkAdapters += New-SCPhysicalComputerNetworkAdapterConfig @vnParams
 }
 
-$VMMostGroup = Get-SCVMHostGroup $VMMostGroupName
 $physicalConfigParams = @{
     BMCAddress = $BMCAddress
     BMCPort = 623 
@@ -304,6 +297,12 @@ while($newHostJob.MostRecentTaskUIState -ne 'Running')
 
 if ( WaitVMMJob($($newHostJob.MostRecentTaskID)) -eq $true)
 {
+    Write-Host "Adding host to cluster `"$ClusterName`"..."
+
+    $VMHosts = @()
+    $VMHosts += Get-SCVMHost $HostName
+    [void](Install-SCVMHostCluster -VMHostCluster $hostCluster -VMHost $VMHosts -SkipValidation -Credential $VMMRunAsAccount)
+
     $endDeployTime = Get-Date
     $totalDeploy = ($endDeployTime - $startDeployTime).Minutes
     Write-Host "Host deployment finished in $totalDiscovery minutes" -ForegroundColor Green
