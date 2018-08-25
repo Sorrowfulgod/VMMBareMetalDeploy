@@ -111,7 +111,7 @@ while ( $(Resolve-DnsName $HostName -ErrorAction SilentlyContinue) -ne $null )
 }
 
 Write-Host "Discovering server `"$($BMCAddress)`"..."
-$deployBlade = Find-SCComputer -BMCAddress $BMCAddress –BMCRunAsAccount $BMCRunAsAccount -BMCProtocol “IPMI” -ErrorAction Stop
+$deployBlade = Find-SCComputer -BMCAddress $BMCAddress –BMCRunAsAccount $BMCRunAsAccount -BMCProtocol "IPMI" -ErrorAction Stop
 
 # This is workaroung for incorrect SMBios report from Huawei BMC (big endian instead little)
 if ($ReverseSMBiosGuid)
